@@ -47,6 +47,7 @@ jobs:
       rga: ${{ steps.filter.outputs.rga }}
       maps: ${{ steps.filter.outputs.maps }}
       mapchecker: ${{ steps.filter.outputs.mapchecker }}
+      shipyard: ${{ steps.filter.outputs.shipyard }}
       schemas: ${{ steps.filter.outputs.schemas }}
       python: ${{ steps.filter.outputs.python }}
     steps:
@@ -104,7 +105,7 @@ jobs:
           has() { grep -qE -- "$1" "$files"; }
           has_other_than() { grep -qvE -- "$1" "$files"; }
 
-          build=false; rsi=false; rga=false; maps=false; mapchecker=false
+          build=false; rsi=false; rga=false; maps=false; mapchecker=false; shipyard=false
 
           # Changes to the CI definition itself run everything.
           if has '^\.github/workflows/dr4gon-(ci|build-release)\.yml$'; then all=true; fi
@@ -117,6 +118,11 @@ jobs:
           if has '(^|/)attributions\.ya?ml$'; then rga=true; fi
           if has '^Resources/Maps/'; then maps=true; fi
           if has '^Resources/Maps/.*\.yml$|^Resources/Prototypes/(.*/)?Entities/.*\.yml$|^\.github/mapchecker/'; then mapchecker=true; fi
+
+          # Same paths as upstream's nf-shipyard-tests workflow. Deliberately not
+          # forced by "all": the shipyard tests check ship prices, which can be
+          # red on master for reasons unrelated to the change under test.
+          if has '^Resources/Maps/_NF/Shuttles/.*\.yml$|^Resources/Prototypes/_NF/Shipyard/.*\.yml$|^Content\.IntegrationTests/Tests/_NF/ShipyardTests\.cs$'; then shipyard=true; fi
 
           # The schemas and their validators live in the engine submodule.
           if has '^RobustToolbox$'; then rsi=true; rga=true; maps=true; fi
@@ -136,6 +142,7 @@ jobs:
             echo "rga=$rga"
             echo "maps=$maps"
             echo "mapchecker=$mapchecker"
+            echo "shipyard=$shipyard"
             echo "schemas=$schemas"
             echo "python=$python"
           } | tee -a "$GITHUB_OUTPUT"
@@ -239,13 +246,19 @@ jobs:
       - name: Run Content.Tests
         run: dotnet test --no-build --configuration DebugOpt Content.Tests/Content.Tests.csproj -- NUnit.ConsoleOut=0
 
-      # No filter: this includes the shipyard tests that upstream runs in a
-      # separate workflow.
+      # As upstream: the shipyard tests are excluded here and run below only
+      # when ships, shipyard prototypes or the tests themselves change.
       - name: Run Content.IntegrationTests
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
           DOTNET_gcServer: "1"
-        run: dotnet test --no-build --configuration DebugOpt Content.IntegrationTests/Content.IntegrationTests.csproj -- NUnit.ConsoleOut=0 NUnit.MapWarningTo=Failed
+        run: dotnet test --no-build --configuration DebugOpt Content.IntegrationTests/Content.IntegrationTests.csproj --filter "FullyQualifiedName!~ShipyardTest" -- NUnit.ConsoleOut=0 NUnit.MapWarningTo=Failed
+
+      - name: Run shipyard tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && needs.changes.outputs.shipyard == 'true' }}
+        env:
+          DOTNET_gcServer: "1"
+        run: dotnet test --no-build --configuration DebugOpt Content.IntegrationTests/Content.IntegrationTests.csproj --filter "FullyQualifiedName~ShipyardTest" -- NUnit.ConsoleOut=0 NUnit.MapWarningTo=Failed
 
   release:
     name: Release
