@@ -132,12 +132,18 @@
   equipment:
     back: ClothingBackpackSatchelAdmin
     id: AdminPDA
+    # Dr4gon: admin toolbelt and folder (ported from TheDen)
+    belt: AdminToolbelt
+    pocket1: BoxFolderAdmin
   storage:
     back:
-    - GasAnalyzer
-    - trayScanner
-    - AccessConfiguratorUniversal
-    - Multitool
+    # Dr4gon: GasAnalyzer, trayScanner, AccessConfiguratorUniversal and Multitool moved to AdminToolbelt
+    - AdminMaterialBox
+    - PowerCellMicroreactor
+    - PowerCellMicroreactor
+    - DrinkGlass
+    - TrashBananaPeel
+    # End Dr4gon
 
 #Gladiator with spear
 - type: startingGear
