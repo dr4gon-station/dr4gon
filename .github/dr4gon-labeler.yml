@@ -1,0 +1,50 @@
+# Path-based pull request labels for dr4gon, applied by
+# .github/workflows/dr4gon-labeler.yml (actions/labeler).
+#
+# The upstream .github/labeler.yml is left untouched and is not used.
+# Every label named here must exist in the repository: the "sync-labels" job
+# of the workflow (run it manually) creates them. Keep both lists in step.
+
+"Map":
+- changed-files:
+  - any-glob-to-any-file: "Resources/Maps/**"
+
+"Sprites":
+- changed-files:
+  - any-glob-to-any-file: "**/*.rsi/**"
+
+"Audio":
+- changed-files:
+  - any-glob-to-any-file: "**/*.ogg"
+
+"UI":
+- changed-files:
+  - any-glob-to-any-file: "**/*.xaml*"
+
+"C#":
+- changed-files:
+  - any-glob-to-any-file: "**/*.cs"
+
+"YML":
+- changed-files:
+  - any-glob-to-any-file: "Resources/Prototypes/**/*.yml"
+
+"FTL":
+- changed-files:
+  - any-glob-to-any-file: "Resources/Locale/**/*.ftl"
+
+"Docs":
+- changed-files:
+  - any-glob-to-any-file:
+    - "**/*.md"
+    - "Resources/ServerInfo/**/*.xml"
+
+"DB Migration":
+- changed-files:
+  - any-glob-to-any-file: "Content.Server.Database/Migrations/**/*.cs"
+
+"CI":
+- changed-files:
+  - any-glob-to-any-file:
+    - ".github/**"
+    - "Tools/**"
