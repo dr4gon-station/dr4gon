@@ -2,21 +2,20 @@ name: "dr4gon: build release"
 
 # Reusable workflow: packages the server and client exactly the way a publish
 # needs them and, optionally, runs the checks that need a Release build
-# (YAML linter, map renderer).
+# (YAML linter).
 #
 # Callers:
 #   - dr4gon-ci.yml       run-checks: true, uploads the packages on master
 #   - dr4gon-publish.yml  fallback build when CI has no package for the commit
 #
 # Packaging always runs first, straight after the restore, on a pristine
-# checkout. The checks run afterwards because the map renderer writes into
-# Resources/MapImages, which must never end up inside a published package.
+# checkout, so nothing the checks produce can end up inside a published package.
 
 on:
   workflow_call:
     inputs:
       run-checks:
-        description: Also build the solution in Release and run the YAML linter and the map renderer.
+        description: Also build the solution in Release and run the YAML linter.
         type: boolean
         default: false
       upload-artifact:
@@ -147,7 +146,3 @@ jobs:
       - name: Run YAML linter
         if: ${{ !cancelled() && inputs.run-checks && steps.build.outcome == 'success' }}
         run: dotnet run --project Content.YAMLLinter/Content.YAMLLinter.csproj --configuration Release --no-build
-
-      - name: Run map renderer
-        if: ${{ !cancelled() && inputs.run-checks && steps.build.outcome == 'success' }}
-        run: dotnet run --project Content.MapRenderer/Content.MapRenderer.csproj --configuration Release --no-build -- Dev

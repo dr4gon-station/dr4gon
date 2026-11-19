@@ -16,7 +16,8 @@ name: "dr4gon: publish"
 
 on:
   schedule:
-    - cron: "17 10 * * *"
+    # 06:07 UTC = 01:07 CDT (00:07 CST in winter; cron is always UTC).
+    - cron: "7 6 * * *"
   workflow_dispatch:
     inputs:
       force-rebuild:

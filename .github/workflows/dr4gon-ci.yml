@@ -5,7 +5,7 @@ name: "dr4gon: CI"
 #   changes        works out which parts of the tree were touched
 #   static-checks  CRLF, RSI, RGA, map file schema, mapchecker (no .NET build)
 #   tests          DebugOpt build, Content.Tests, all integration tests
-#   release        packaging test + Release build for YAML linter / map renderer
+#   release        packaging test + Release build for the YAML linter
 #                  (dr4gon-build-release.yml); on master the packages are kept
 #                  as an artifact so dr4gon-publish.yml can reuse them
 #   ci-success     single status to use as a required check
