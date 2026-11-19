@@ -1,0 +1,283 @@
+name: "dr4gon: CI"
+
+# One workflow for everything a pull request or a push to master needs:
+#
+#   changes        works out which parts of the tree were touched
+#   static-checks  CRLF, RSI, RGA, map file schema, mapchecker (no .NET build)
+#   tests          DebugOpt build, Content.Tests, all integration tests
+#   release        packaging test + Release build for YAML linter / map renderer
+#                  (dr4gon-build-release.yml); on master the packages are kept
+#                  as an artifact so dr4gon-publish.yml can reuse them
+#   ci-success     single status to use as a required check
+#
+# Replaces the upstream build-test-debug, nf-shipyard-tests, yaml-linter,
+# build-map-renderer, test-packaging, check-crlf, validate-rsis, validate-rgas,
+# validate_mapfiles and nf-mapchecker workflows.
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to a pull request cancels the run it supersedes. Runs on master
+# are never cancelled: each commit keeps its own result and release artifact.
+concurrency:
+  group: dr4gon-ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('{0}-{1}', github.event_name, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+
+jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      build: ${{ steps.filter.outputs.build }}
+      rsi: ${{ steps.filter.outputs.rsi }}
+      rga: ${{ steps.filter.outputs.rga }}
+      maps: ${{ steps.filter.outputs.maps }}
+      mapchecker: ${{ steps.filter.outputs.mapchecker }}
+      schemas: ${{ steps.filter.outputs.schemas }}
+      python: ${{ steps.filter.outputs.python }}
+    steps:
+      # Only commits and trees are needed to list changed paths. A sparse
+      # checkout is a blobless partial clone, so this stays fast.
+      - name: Checkout (trees only)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          sparse-checkout: .github/workflows
+
+      - name: Classify changed paths
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          files="$RUNNER_TEMP/changed-files.txt"
+          : > "$files"
+          all=false
+          base=""
+
+          case "$EVENT_NAME" in
+            pull_request)
+              # HEAD is the merge commit of the pull request into master, so its
+              # first parent is the current tip of master.
+              if git rev-parse -q --verify 'HEAD^2' > /dev/null; then
+                base="$(git rev-parse 'HEAD^1')"
+              else
+                all=true
+              fi
+              ;;
+            push)
+              if [[ "$BEFORE" =~ ^[0-9a-f]{40}$ && ! "$BEFORE" =~ ^0+$ ]] \
+                && git fetch --quiet --no-tags --depth=1 --filter=blob:none origin "$BEFORE"; then
+                base="$BEFORE"
+              else
+                all=true
+              fi
+              ;;
+            *)
+              all=true
+              ;;
+          esac
+
+          if [[ "$all" == false ]]; then
+            if ! git -c core.quotePath=false diff --no-renames --name-only "$base" HEAD > "$files"; then
+              echo "::warning::Could not list changed files, running everything"
+              all=true
+            fi
+          fi
+
+          has() { grep -qE -- "$1" "$files"; }
+          has_other_than() { grep -qvE -- "$1" "$files"; }
+
+          build=false; rsi=false; rga=false; maps=false; mapchecker=false
+
+          # Changes to the CI definition itself run everything.
+          if has '^\.github/workflows/dr4gon-(ci|build-release)\.yml$'; then all=true; fi
+
+          # Anything outside this short list of files that cannot affect the
+          # build or the game content triggers the .NET jobs.
+          if has_other_than '^(\.github/|\.vscode/|[^/]+\.md$|LICENSE)'; then build=true; fi
+
+          if has '\.rsi/'; then rsi=true; fi
+          if has '(^|/)attributions\.ya?ml$'; then rga=true; fi
+          if has '^Resources/Maps/'; then maps=true; fi
+          if has '^Resources/Maps/.*\.yml$|^Resources/Prototypes/(.*/)?Entities/.*\.yml$|^\.github/mapchecker/'; then mapchecker=true; fi
+
+          # The schemas and their validators live in the engine submodule.
+          if has '^RobustToolbox$'; then rsi=true; rga=true; maps=true; fi
+
+          if [[ "$all" == true ]]; then
+            build=true; rsi=true; rga=true; maps=true; mapchecker=true
+          fi
+
+          schemas=false
+          if [[ "$rsi" == true || "$rga" == true || "$maps" == true ]]; then schemas=true; fi
+          python=false
+          if [[ "$rsi" == true || "$mapchecker" == true ]]; then python=true; fi
+
+          {
+            echo "build=$build"
+            echo "rsi=$rsi"
+            echo "rga=$rga"
+            echo "maps=$maps"
+            echo "mapchecker=$mapchecker"
+            echo "schemas=$schemas"
+            echo "python=$python"
+          } | tee -a "$GITHUB_OUTPUT"
+
+          echo "Changed files: $(wc -l < "$files") (everything forced: $all)"
+
+  static-checks:
+    name: Static checks
+    needs: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      # The engine submodule is only needed for the RSI, RGA and map schemas.
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: ${{ needs.changes.outputs.schemas == 'true' }}
+          persist-credentials: false
+
+      # Looks at every text file in the tree, so it is not path-gated.
+      - name: Check for CRLF line endings
+        run: python3 Tools/check_crlf.py
+
+      - name: Setup Python
+        if: ${{ !cancelled() && needs.changes.outputs.python == 'true' }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Validate RSIs
+        if: ${{ !cancelled() && needs.changes.outputs.rsi == 'true' }}
+        run: |
+          python3 -m pip install --quiet pillow jsonschema
+          python3 RobustToolbox/Schemas/validate_rsis.py Resources/
+
+      - name: Validate RGA attribution files
+        if: ${{ !cancelled() && needs.changes.outputs.rga == 'true' }}
+        uses: PaulRitter/yaml-schema-validator@3d153666aa5d5cd6af5fd030c364aec8d8bfd7f4 # v1
+        with:
+          schema: RobustToolbox/Schemas/rga.yml
+          path_pattern: .*attributions.ya?ml$
+          validators_path: RobustToolbox/Schemas/rga_validators.py
+          validators_requirements: RobustToolbox/Schemas/rga_requirements.txt
+
+      - name: Validate map files
+        if: ${{ !cancelled() && needs.changes.outputs.maps == 'true' }}
+        uses: PaulRitter/yaml-schema-validator@3d153666aa5d5cd6af5fd030c364aec8d8bfd7f4 # v1
+        with:
+          schema: RobustToolbox/Schemas/mapfile.yml
+          path_pattern: .*Resources/Maps/.*
+          validators_path: RobustToolbox/Schemas/mapfile_validators.py
+          validators_requirements: RobustToolbox/Schemas/mapfile_requirements.txt
+
+      - name: Run mapchecker
+        if: ${{ !cancelled() && needs.changes.outputs.mapchecker == 'true' }}
+        run: |
+          python3 -m pip install --quiet -r .github/mapchecker/requirements.txt
+          python3 .github/mapchecker/mapchecker.py
+
+  tests:
+    name: Tests (DebugOpt)
+    needs: changes
+    if: ${{ needs.changes.outputs.build == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Setup .NET
+        id: dotnet
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      # Restore only: the cache is written by the release job on master (see
+      # dr4gon-build-release.yml), with the same key expression.
+      - name: Restore NuGet cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ steps.dotnet.outputs.dotnet-version }}-${{ hashFiles('global.json', 'nuget.config', 'Directory.Packages.props', '*/*.csproj', 'RobustToolbox/**/*.csproj', 'RobustToolbox/**/*.props', 'RobustToolbox/**/*.targets') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-${{ steps.dotnet.outputs.dotnet-version }}-
+            nuget-${{ runner.os }}-
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build (DebugOpt)
+        id: build
+        run: dotnet build --configuration DebugOpt --no-restore /m
+
+      - name: Run Content.Tests
+        run: dotnet test --no-build --configuration DebugOpt Content.Tests/Content.Tests.csproj -- NUnit.ConsoleOut=0
+
+      # No filter: this includes the shipyard tests that upstream runs in a
+      # separate workflow.
+      - name: Run Content.IntegrationTests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          DOTNET_gcServer: "1"
+        run: dotnet test --no-build --configuration DebugOpt Content.IntegrationTests/Content.IntegrationTests.csproj -- NUnit.ConsoleOut=0 NUnit.MapWarningTo=Failed
+
+  release:
+    name: Release
+    needs: changes
+    if: ${{ needs.changes.outputs.build == 'true' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/dr4gon-build-release.yml
+    with:
+      run-checks: true
+      # Only commits that are on master are ever offered to the publish workflow.
+      upload-artifact: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' }}
+      retention-days: 5
+
+  ci-success:
+    name: CI success
+    if: ${{ always() }}
+    needs: [changes, static-checks, tests, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Check job results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          # Skipped is fine (path-gated); failed or cancelled is not.
+          if echo "$NEEDS" | jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' > /dev/null; then
+            echo "::error::At least one CI job failed or was cancelled"
+            exit 1
+          fi
+          # The change detection itself must have worked.
+          echo "$NEEDS" | jq -e '.changes.result == "success"' > /dev/null

@@ -1,0 +1,153 @@
+name: "dr4gon: build release"
+
+# Reusable workflow: packages the server and client exactly the way a publish
+# needs them and, optionally, runs the checks that need a Release build
+# (YAML linter, map renderer).
+#
+# Callers:
+#   - dr4gon-ci.yml       run-checks: true, uploads the packages on master
+#   - dr4gon-publish.yml  fallback build when CI has no package for the commit
+#
+# Packaging always runs first, straight after the restore, on a pristine
+# checkout. The checks run afterwards because the map renderer writes into
+# Resources/MapImages, which must never end up inside a published package.
+
+on:
+  workflow_call:
+    inputs:
+      run-checks:
+        description: Also build the solution in Release and run the YAML linter and the map renderer.
+        type: boolean
+        default: false
+      upload-artifact:
+        description: Upload release/ as the artifact dr4gon-release-<sha>.
+        type: boolean
+        default: false
+      retention-days:
+        description: How long the uploaded artifact is kept.
+        type: number
+        default: 5
+    outputs:
+      artifact-name:
+        description: Name of the uploaded artifact (empty when nothing was uploaded).
+        value: ${{ jobs.release.outputs.artifact-name }}
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+
+jobs:
+  release:
+    name: Release build
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      artifact-name: ${{ steps.upload.outcome == 'success' && steps.meta.outputs.artifact-name || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Setup .NET
+        id: dotnet
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      # Same key expression as the tests job in dr4gon-ci.yml, which only restores.
+      - name: Restore NuGet cache
+        id: nuget-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ steps.dotnet.outputs.dotnet-version }}-${{ hashFiles('global.json', 'nuget.config', 'Directory.Packages.props', '*/*.csproj', 'RobustToolbox/**/*.csproj', 'RobustToolbox/**/*.props', 'RobustToolbox/**/*.targets') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-${{ steps.dotnet.outputs.dotnet-version }}-
+            nuget-${{ runner.os }}-
+
+      - name: Restore dependencies
+        id: restore
+        run: dotnet restore
+
+      - name: Artifact name
+        id: meta
+        run: echo "artifact-name=dr4gon-release-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      # Content.Packaging wipes bin/ and rebuilds every target itself
+      # (/t:Rebuild /p:FullRelease=true), so nothing built earlier can leak in.
+      - name: Package server
+        id: package-server
+        run: >-
+          dotnet run --project Content.Packaging/Content.Packaging.csproj --configuration Release --
+          server --platform win-x64 --platform linux-x64 --platform osx-x64 --platform linux-arm64
+
+      - name: Package client
+        id: package-client
+        run: >-
+          dotnet run --project Content.Packaging/Content.Packaging.csproj --configuration Release --
+          client --no-wipe-release
+
+      - name: Verify packages
+        id: verify
+        run: |
+          set -euo pipefail
+          expected="SS14.Client.zip SS14.Server_linux-arm64.zip SS14.Server_linux-x64.zip SS14.Server_osx-x64.zip SS14.Server_win-x64.zip"
+          actual="$(find release -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "::error::Unexpected contents of release/: '$actual' (expected '$expected')"
+            exit 1
+          fi
+          for f in release/*.zip; do
+            unzip -tq "$f"
+          done
+          {
+            echo "### Release packages for \`${GITHUB_SHA}\`"
+            echo
+            echo '```'
+            (cd release && sha256sum -- *.zip)
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload packages
+        id: upload
+        if: ${{ inputs.upload-artifact }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.meta.outputs.artifact-name }}
+          path: release/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: ${{ inputs.retention-days }}
+          overwrite: true
+
+      # Only trusted refs write the cache: a cache saved from master is readable
+      # by every branch and by the publish workflow. Saved after packaging so it
+      # also holds the per-platform runtime packs.
+      - name: Save NuGet cache
+        if: ${{ !cancelled() && steps.verify.outcome == 'success' && steps.nuget-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request' && github.ref == 'refs/heads/master' }}
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.nuget/packages
+          key: ${{ steps.nuget-cache.outputs.cache-primary-key }}
+
+      # ---- Checks that need a Release build (CI only) ----
+
+      - name: Build solution (Release)
+        id: build
+        if: ${{ !cancelled() && inputs.run-checks && steps.restore.outcome == 'success' }}
+        run: dotnet build --configuration Release --no-restore /p:WarningsAsErrors= /m
+
+      - name: Run YAML linter
+        if: ${{ !cancelled() && inputs.run-checks && steps.build.outcome == 'success' }}
+        run: dotnet run --project Content.YAMLLinter/Content.YAMLLinter.csproj --configuration Release --no-build
+
+      - name: Run map renderer
+        if: ${{ !cancelled() && inputs.run-checks && steps.build.outcome == 'success' }}
+        run: dotnet run --project Content.MapRenderer/Content.MapRenderer.csproj --configuration Release --no-build -- Dev
