@@ -1,0 +1,156 @@
+name: "dr4gon: labeler"
+
+# All automatic labelling in one place. Replaces the eight upstream
+# labeler-*.yml workflows.
+#
+#   pull-request  path labels (.github/dr4gon-labeler.yml) and a size label
+#   conflicts     "S: Merge Conflict" on pull requests that no longer merge
+#   issue         "S: Untriaged" on new issues that have no label
+#   sync-labels   manual: creates the labels used above if they are missing
+#
+# Safety under pull_request_target: no job checks out or runs code from the
+# pull request, and nothing the author controls (title, body, branch name) is
+# ever passed to a shell. The jobs only call the GitHub API.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  issues:
+    types: [opened]
+  # A push to master is what usually creates conflicts in open pull requests.
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: dr4gon-labeler-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pull-request:
+    name: Path and size labels
+    if: ${{ github.event_name == 'pull_request_target' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read # read .github/dr4gon-labeler.yml from master through the API
+      pull-requests: write # add and remove labels
+    steps:
+      - name: Path labels
+        uses: actions/labeler@v7
+        with:
+          configuration-path: .github/dr4gon-labeler.yml
+          sync-labels: true
+
+      - name: Size label
+        if: ${{ !cancelled() }}
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const number = context.payload.pull_request.number;
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+
+            // Changed lines (additions + deletions), same thresholds as upstream.
+            const sizes = [[5000, 'size/XL'], [1000, 'size/L'], [100, 'size/M'], [10, 'size/S'], [0, 'size/XS']];
+            const changed = pr.additions + pr.deletions;
+            const wanted = sizes.find(([min]) => changed >= min)[1];
+            const current = pr.labels.map(label => label.name);
+
+            for (const name of current) {
+              if (name.startsWith('size/') && name !== wanted) {
+                await github.rest.issues.removeLabel({ owner, repo, issue_number: number, name })
+                  .catch(error => { if (error.status !== 404) throw error; });
+              }
+            }
+            if (!current.includes(wanted)) {
+              await github.rest.issues.addLabels({ owner, repo, issue_number: number, labels: [wanted] });
+            }
+            core.info(`${changed} changed lines: ${wanted}`);
+
+  conflicts:
+    name: Merge conflict label
+    if: ${{ github.event_name == 'pull_request_target' || github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write # label and comment
+    steps:
+      - name: Label conflicting pull requests
+        uses: eps1lon/actions-label-merge-conflict@0273be72a0bbd58fcd71d0d6c02c209b50d1e5e1 # v3.1.0
+        with:
+          dirtyLabel: "S: Merge Conflict"
+          repoToken: ${{ github.token }}
+          commentOnDirty: "This pull request has conflicts with master. Please resolve them so it can be reviewed."
+
+  issue:
+    name: Untriaged label
+    if: ${{ github.event_name == 'issues' && github.event.issue.labels[0] == null }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Add S Untriaged
+        uses: actions/github-script@v9
+        with:
+          script: |
+            await github.rest.issues.addLabels({
+              ...context.repo,
+              issue_number: context.payload.issue.number,
+              labels: ['S: Untriaged'],
+            });
+
+  # Run from the Actions tab (or `gh workflow run dr4gon-labeler.yml`) once
+  # after enabling this workflow, and again whenever a label is added to the
+  # list below or to .github/dr4gon-labeler.yml. Existing labels are left alone.
+  sync-labels:
+    name: Create missing labels
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write # creating labels
+    steps:
+      - name: Create missing labels
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const labels = [
+              // Path labels, see .github/dr4gon-labeler.yml
+              { name: 'Map', color: '0e8a16', description: 'Changes map or grid files' },
+              { name: 'Sprites', color: 'c5def5', description: 'Changes RSI sprites' },
+              { name: 'Audio', color: 'c5def5', description: 'Changes audio files' },
+              { name: 'UI', color: '1d76db', description: 'Changes XAML user interfaces' },
+              { name: 'C#', color: '5319e7', description: 'Changes C# code' },
+              { name: 'YML', color: 'fbca04', description: 'Changes prototypes' },
+              { name: 'FTL', color: 'fef2c0', description: 'Changes localisation files' },
+              { name: 'Docs', color: '0075ca', description: 'Changes documentation or the guidebook' },
+              { name: 'DB Migration', color: 'b60205', description: 'Adds or changes a database migration' },
+              { name: 'CI', color: 'bfd4f2', description: 'Changes workflows or tooling' },
+              // Size labels
+              { name: 'size/XS', color: 'ededed', description: 'Fewer than 10 changed lines' },
+              { name: 'size/S', color: 'ededed', description: '10 to 99 changed lines' },
+              { name: 'size/M', color: 'ededed', description: '100 to 999 changed lines' },
+              { name: 'size/L', color: 'ededed', description: '1000 to 4999 changed lines' },
+              { name: 'size/XL', color: 'ededed', description: '5000 or more changed lines' },
+              // Status labels
+              { name: 'S: Merge Conflict', color: 'd93f0b', description: 'Has conflicts with master' },
+              { name: 'S: Untriaged', color: 'd4c5f9', description: 'Not looked at by a maintainer yet' },
+            ];
+
+            const existing = new Set(
+              (await github.paginate(github.rest.issues.listLabelsForRepo, { ...context.repo, per_page: 100 }))
+                .map(label => label.name.toLowerCase()));
+
+            for (const label of labels) {
+              if (existing.has(label.name.toLowerCase())) {
+                core.info(`exists:  ${label.name}`);
+                continue;
+              }
+              await github.rest.issues.createLabel({ ...context.repo, ...label });
+              core.info(`created: ${label.name}`);
+            }
