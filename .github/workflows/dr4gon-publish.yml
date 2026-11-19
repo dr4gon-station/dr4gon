@@ -1,0 +1,274 @@
+name: "dr4gon: publish"
+
+# Publishes the current tip of master to the ss14.run CDN, once a day or on
+# demand. Replaces the upstream publish.yml (no changelog/RSS steps).
+#
+#   check    asks the CDN whether this commit is already published and stops
+#            the run (green) if it is; otherwise looks for the packages that
+#            dr4gon-ci.yml built for the same commit on master
+#   build    fallback: packages from scratch (dr4gon-build-release.yml) when CI
+#            has nothing reusable for this commit
+#   publish  downloads the packages (from CI or from the fallback build) and
+#            uploads them with Tools/publish_multi_request.py
+#
+# The version published is GITHUB_SHA, and the CDN rejects a version it
+# already has, so "nothing new" means "the CDN already has this commit".
+
+on:
+  schedule:
+    - cron: "17 10 * * *"
+  workflow_dispatch:
+    inputs:
+      force-rebuild:
+        description: Ignore packages built by CI and build from scratch
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Never cancel a publish that is under way: a later run waits for it, then
+# finds the commit on the CDN and exits early.
+concurrency:
+  group: dr4gon-publish
+  cancel-in-progress: false
+
+env:
+  # Must match ROBUST_CDN_URL and FORK_ID in Tools/publish_multi_request.py
+  # (checked in the publish job).
+  CDN_URL: https://cdn.ss14.run/
+  FORK_ID: dr4gon
+  CLIENT_ZIP: SS14.Client.zip
+
+jobs:
+  check:
+    name: Check for something to publish
+    # Forks of this repository have neither the token nor the CDN fork.
+    if: ${{ github.repository_owner == 'dr4gon-station' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read # look up the CI run and its artifact for this commit
+    outputs:
+      publish: ${{ steps.cdn.outputs.publish }}
+      artifact-run-id: ${{ steps.artifact.outputs.run-id }}
+    steps:
+      - name: Only publish from master
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/master" ]]; then
+            echo "::error::Publishing is only allowed from master, not from $GITHUB_REF"
+            exit 1
+          fi
+
+      # Robust.Cdn endpoints used (both public for a non-private fork):
+      #   GET /fork/{fork}/manifest                       versions that finished ingesting
+      #   GET /fork/{fork}/version/{version}/file/{file}  404 unless the version exists
+      # The second one tests the same table the publish endpoint uses to reject
+      # a duplicate version, so it also covers a version that was uploaded but
+      # is not listed in the manifest yet.
+      - name: Ask the CDN whether this commit is published
+        id: cdn
+        run: |
+          set -euo pipefail
+          base="${CDN_URL%/}/fork/${FORK_ID}"
+
+          manifest="$RUNNER_TEMP/manifest.json"
+          code="$(curl -sS --retry 5 --retry-delay 10 --retry-all-errors --max-time 60 \
+            -o "$manifest" -w '%{http_code}' "$base/manifest")" || {
+            echo "::error::Could not reach the CDN manifest at $base/manifest"
+            exit 1
+          }
+          case "$code" in
+            200) listed="$(jq --arg v "$GITHUB_SHA" '.builds | has($v)' "$manifest")" ;;
+            404) listed=false ;; # no build has been published for this fork yet
+            *)
+              echo "::error::Unexpected HTTP $code from $base/manifest"
+              exit 1
+              ;;
+          esac
+
+          # One byte of the client zip; --max-filesize stops a server that ignores the range.
+          code="$(curl -sS --retry 3 --retry-delay 10 --max-time 60 --range 0-0 --max-filesize 1048576 \
+            -o /dev/null -w '%{http_code}' "$base/version/${GITHUB_SHA}/file/${CLIENT_ZIP}")" || true
+          case "$code" in
+            200 | 206) exists=true ;;
+            404) exists=false ;;
+            *)
+              echo "::error::Unexpected HTTP ${code:-error} from the CDN version probe"
+              exit 1
+              ;;
+          esac
+
+          if [[ "$listed" == true ]]; then
+            publish=false
+            message="\`${GITHUB_SHA}\` is already published. Nothing to do."
+          elif [[ "$exists" == true ]]; then
+            publish=false
+            message="\`${GITHUB_SHA}\` was already uploaded to the CDN but is not listed in its manifest. Nothing to publish."
+            echo "::warning::${GITHUB_SHA} exists on the CDN but is not in the manifest. If this persists, check the CDN's ingest."
+          else
+            publish=true
+            message="\`${GITHUB_SHA}\` is not on the CDN yet. Publishing."
+          fi
+
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "$message" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Packages are reused only from a run of dr4gon-ci.yml that was triggered
+      # in this repository for master at exactly this commit. Pull request runs
+      # can never match. Any doubt (or any API error) means a full build.
+      - name: Look for packages built by CI
+        id: artifact
+        if: ${{ steps.cdn.outputs.publish == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE_REBUILD: ${{ inputs.force-rebuild }}
+        run: |
+          set -uo pipefail
+          run_id=""
+
+          if [[ "$FORCE_REBUILD" == "true" ]]; then
+            echo "Rebuild forced, not looking for CI packages."
+          else
+            name="dr4gon-release-${GITHUB_SHA}"
+            candidates="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${name}&per_page=100" \
+              --jq '.artifacts[] | select(.expired == false) | .workflow_run.id' | sort -rn | uniq)" || candidates=""
+
+            for id in $candidates; do
+              ok="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${id}" --jq '
+                .path == ".github/workflows/dr4gon-ci.yml"
+                and (.event == "push" or .event == "workflow_dispatch")
+                and .head_branch == "master"
+                and .head_sha == env.GITHUB_SHA
+                and .repository.id == .head_repository.id
+              ')" || ok=false
+              if [[ "$ok" == "true" ]]; then
+                run_id="$id"
+                break
+              fi
+            done
+          fi
+
+          echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
+          if [[ -n "$run_id" ]]; then
+            echo "Reusing the packages built by CI run ${run_id}." | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No reusable CI packages for this commit, building from scratch." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+  build:
+    name: Build
+    needs: check
+    if: ${{ needs.check.outputs.publish == 'true' && needs.check.outputs.artifact-run-id == '' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/dr4gon-build-release.yml
+    with:
+      run-checks: false
+      upload-artifact: true
+      retention-days: 3
+
+  publish:
+    name: Publish to CDN
+    needs: [check, build]
+    if: >-
+      ${{
+        !cancelled()
+        && needs.check.outputs.publish == 'true'
+        && (
+          needs.build.result == 'success'
+          || (needs.build.result == 'skipped' && needs.check.outputs.artifact-run-id != '')
+        )
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read # download the artifact of another run
+    steps:
+      # The engine submodule is needed because the publish script reads the
+      # engine version from its tag. No build happens in this job.
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+          persist-credentials: false
+
+      - name: Check publish script configuration
+        run: |
+          set -euo pipefail
+          # Guards against an upstream merge resetting the script to another CDN or fork.
+          if ! grep -qF "ROBUST_CDN_URL = \"${CDN_URL}\"" Tools/publish_multi_request.py \
+            || ! grep -qF "FORK_ID = \"${FORK_ID}\"" Tools/publish_multi_request.py; then
+            echo "::error::Tools/publish_multi_request.py no longer targets ${CDN_URL} with fork id ${FORK_ID}"
+            exit 1
+          fi
+
+      # The submodule is a shallow clone without tags. Fetch the tag that
+      # points at the pinned engine commit; if the pin is not a tagged commit,
+      # fall back to the full history so `git describe` can find the nearest tag.
+      - name: Resolve engine version
+        working-directory: RobustToolbox
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          tag="$(git ls-remote --tags origin \
+            | awk -v sha="$sha" '$1 == sha { sub("^refs/tags/", "", $2); sub(/\^\{\}$/, "", $2); print $2 }' \
+            | grep -E '^v[0-9]' | sort -V | tail -n 1 || true)"
+          if [[ -n "$tag" ]]; then
+            git fetch --quiet --no-tags --depth=1 origin "refs/tags/${tag}:refs/tags/${tag}"
+          else
+            echo "::warning::Engine commit $sha is not a tagged release, fetching full engine history"
+            git fetch --quiet --tags --unshallow origin
+          fi
+          engine="$(git describe --tags --abbrev=0)"
+          [[ "$engine" == v* ]]
+          echo "Engine version: ${engine#v}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Download packages
+        uses: actions/download-artifact@v8
+        with:
+          name: dr4gon-release-${{ github.sha }}
+          path: release
+          run-id: ${{ needs.check.outputs.artifact-run-id || github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify packages
+        run: |
+          set -euo pipefail
+          expected="SS14.Client.zip SS14.Server_linux-arm64.zip SS14.Server_linux-x64.zip SS14.Server_osx-x64.zip SS14.Server_win-x64.zip"
+          actual="$(find release -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "::error::Unexpected contents of release/: '$actual' (expected '$expected')"
+            exit 1
+          fi
+          for f in release/*.zip; do
+            unzip -tq "$f"
+          done
+          (cd release && sha256sum -- *.zip)
+
+      - name: Install publish script dependencies
+        run: python3 -c 'import requests' 2> /dev/null || sudo apt-get install -y --no-install-recommends python3-requests
+
+      - name: Publish version
+        env:
+          PUBLISH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
+        run: python3 Tools/publish_multi_request.py
+
+      # The upload is accepted before the CDN has ingested the client files.
+      # Wait until the version is listed, so that a green run means the build
+      # is really being served.
+      - name: Wait for the CDN to list the version
+        run: |
+          set -euo pipefail
+          url="${CDN_URL%/}/fork/${FORK_ID}/manifest"
+          for _ in $(seq 1 60); do
+            if curl -sS --max-time 30 "$url" | jq -e --arg v "$GITHUB_SHA" '.builds | has($v)' > /dev/null; then
+              echo "Published \`${GITHUB_SHA}\` to ${CDN_URL}fork/${FORK_ID}." | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::The upload succeeded but ${GITHUB_SHA} is still not in the CDN manifest after 15 minutes. Check the CDN's ingest; re-running this workflow will not help."
+          exit 1
